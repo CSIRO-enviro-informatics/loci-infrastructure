@@ -1,0 +1,318 @@
+name: LOCI Time Demo Deployment Pipeline
+
+trigger:
+  tags:
+    include:
+      - time-demo/BUILD*
+      - time-demo/DESTROY*
+
+# Variables from Pipeline
+#AWS_ID
+#O2D_NUMBER
+#ROLE_ID (Secret)
+#SECRET_ID (Secret)
+#USER_ROLE_NAME
+#VAULT_ADDR
+
+stages:
+  - stage: retrieveAWSCreds
+    displayName: Retrieve AWS Credentials
+    jobs:
+      # Get AWS creds from Hashicorp Vault
+      - job: processVault
+        displayName: Get AWS credentials from Vault
+        steps:
+          - task: Bash@3
+            name: vaultClientInstaller
+            displayName: Vault client installer
+            inputs:
+              targetType: inline
+              script: |
+                echo Downloading Vault archive and checksum
+                VAULT_DOWNLOAD_ADDRESS="https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip"
+                echo "Downloading from: ${VAULT_DOWNLOAD_ADDRESS} with version ${VAULT_VERSION}."
+                curl -fsSL  ${VAULT_DOWNLOAD_ADDRESS}\
+                  -o ./vault_${VAULT_VERSION}_linux_amd64.zip
+                REMOTE_SHA=$(curl -fsSL https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_SHA256SUMS \
+                  | grep vault_${VAULT_VERSION}_linux_amd64.zip)
+                LOCAL_SHA=$(sha256sum vault_${VAULT_VERSION}_linux_amd64.zip)
+                echo "Remote file SHA is: $REMOTE_SHA"
+                echo "Local file SHA is: $LOCAL_SHA"
+                if [[ "$REMOTE_SHA" == "$LOCAL_SHA" ]]
+                then
+                  unzip -o ./vault_${VAULT_VERSION}_linux_amd64.zip
+                  chmod +x ./vault
+                else
+                  echo "##[error] Checksums do not match!"
+                  exit 1
+                fi
+          - task: Bash@3
+            name: generateAWSCreds
+            displayName: Generate AWS cross-account credentials
+            inputs:
+              targetType: inline
+              script: |
+                echo 'login to vault'
+                VAULT_TOKEN=$(./vault write -format=json auth/approle/acl_vlt_${O2D_NUMBER}/login role_id=$(ROLE_ID) secret_id=$(SECRET_ID) \
+                  | jq -r '.auth.client_token')
+                ./vault login -no-print $VAULT_TOKEN
+                echo 'Generate credentials with token'
+                VAULT_AWS_CREDS=$(./vault read acl_vlt_${O2D_NUMBER}/${AWS_ID}/aws-engine/creds/${USER_ROLE_NAME} -format=json)
+                echo 'Keys retrieved'
+                AWS_ACCESS_KEY_ID=$(echo $VAULT_AWS_CREDS | jq -r .data.access_key)
+                AWS_SECRET_ACCESS_KEY=$(echo $VAULT_AWS_CREDS | jq -r .data.secret_key)
+                AWS_SESSION_TOKEN=$(echo $VAULT_AWS_CREDS | jq -r .data.security_token)
+                # Setup environment variables for remaining tasks
+                echo "##vso[task.setvariable variable=vaultToken;isOutput=true;isSecret=true]$VAULT_TOKEN"
+                echo "##vso[task.setvariable variable=vaultAwsLeaseId;isOutput=true;isSecret=true]$(echo $VAULT_AWS_CREDS | jq -r .lease_id)"
+                echo "##vso[task.setvariable variable=awsAccessKeyId;isOutput=true;isSecret=true]$AWS_ACCESS_KEY_ID"
+                echo "##vso[task.setvariable variable=awsSecretAccessKey;isOutput=true;isSecret=true]$AWS_SECRET_ACCESS_KEY"
+                if [[ $AWS_SESSION_TOKEN && $AWS_SESSION_TOKEN != 'null' ]]
+                then
+                  echo "##vso[task.setvariable variable=awsSessionToken;isOutput=true;isSecret=true]$AWS_SESSION_TOKEN"
+                fi
+            env:
+              AWS_ID: $(AWS_ID)
+              O2D_NUMBER: $(O2D_NUMBER)
+              ROLE_ID: $(ROLE_ID)
+              SECRET_ID: $(SECRET_ID)
+              USER_ROLE_NAME: $(USER_ROLE_NAME)
+              VAULT_ADDR: $(VAULT_ADDR)
+
+      # Test AWS credentials from Vault
+      - job: testCreds
+        displayName: DEBUG - Test AWS credentials retrieved from Vault
+        dependsOn:
+          - processVault
+        variables:
+          awsAccessKeyId: $[ dependencies.processVault.outputs['generateAWSCreds.awsAccessKeyId'] ]
+          awsSecretAccessKey: $[ dependencies.processVault.outputs['generateAWSCreds.awsSecretAccessKey'] ]
+          awsSessionToken: $[ dependencies.processVault.outputs['generateAWSCreds.awsSessionToken'] ]
+        steps:
+          - task: Bash@3
+            name: testAWScredsPass
+            displayName: Test AWS credentials passing between tasks
+            env:
+              AWS_ACCESS_KEY_ID: $(awsAccessKeyId)
+              AWS_SECRET_ACCESS_KEY: $(awsSecretAccessKey)
+              AWS_SESSION_TOKEN: $(awsSessionToken)
+            continueOnError: true
+            inputs:
+              targetType: inline
+              script: |
+                # Validate account credentials are present
+                env | grep AWS
+                aws sts get-caller-identity
+                aws s3 ls
+
+  # Get the git tag which triggered build
+  - stage: retrieveGitTag
+    displayName: Retrieve Git Tag
+    jobs:
+      - job: retrieveTag
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: Bash@3
+            name: gitDescribeTask
+            displayName: Retrieve Git Tag
+            inputs:
+              targetType: inline
+              script: |
+                echo "Retrieving current tag."
+                current_tag=$(git tag --sort=-creatordate | awk -F " " '{if (NR == 1) print $1}')
+                echo "Current tag: ${current_tag}"
+                echo "##vso[task.setvariable variable=gitTag;isOutput=true]$current_tag"
+
+  # Deploy CDK Application
+  - stage: deployAPIInfrastructure
+    displayName: Deploy API Infrastructure
+    dependsOn:
+      - retrieveAWSCreds
+      - retrieveGitTag
+    variables:
+      gitTag: $[ stageDependencies.retrieveGitTag.retrieveTag.outputs['gitDescribeTask.gitTag'] ]
+    jobs:
+      - job: deployApp
+        condition: startsWith(variables.gitTag,'time-demo/BUILD')
+        variables:
+          awsAccessKeyId: $[ stageDependencies.retrieveAWSCreds.processVault.outputs['generateAWSCreds.awsAccessKeyId'] ]
+          awsSecretAccessKey: $[ stageDependencies.retrieveAWSCreds.processVault.outputs['generateAWSCreds.awsSecretAccessKey'] ]
+          awsSessionToken: $[ stageDependencies.retrieveAWSCreds.processVault.outputs['generateAWSCreds.awsSessionToken'] ]
+          region: ap-southeast-2
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: "10.x"
+            displayName: "Install Node.js"
+          - script: |
+              echo "Installing aws-cdk"
+              sudo npm install -g aws-cdk 
+
+              echo "Creating virtual environment"
+              sudo apt-get install python3-venv 
+
+              echo "Moving to app folder"
+              cd time_api_infrastructure
+
+              python3 -m venv .venv 
+              source .venv/bin/activate 
+
+              echo "Installing python requirements"
+              pip install -r requirements.txt
+            displayName: Setup environment
+          - script: |
+              echo "Running CDK Deploy"
+              cd time_api_infrastructure
+              source .venv/bin/activate 
+              cdk deploy --require-approval never
+            displayName: CDK Deploy
+            env:
+              AWS_ACCESS_KEY_ID: $(awsAccessKeyId)
+              AWS_SECRET_ACCESS_KEY: $(awsSecretAccessKey)
+              AWS_SESSION_TOKEN: $(awsSessionToken)
+              AWS_DEFAULT_REGION: $(region)
+      - job: deployStaticWebsite
+        dependsOn:
+          - deployApp
+        variables:
+          awsAccessKeyId: $[ stageDependencies.retrieveAWSCreds.processVault.outputs['generateAWSCreds.awsAccessKeyId'] ]
+          awsSecretAccessKey: $[ stageDependencies.retrieveAWSCreds.processVault.outputs['generateAWSCreds.awsSecretAccessKey'] ]
+          awsSessionToken: $[ stageDependencies.retrieveAWSCreds.processVault.outputs['generateAWSCreds.awsSessionToken'] ]
+          appRepo: https://github.com/PeterBaker0/loci-integration-app
+          appBranch: timedemo
+          repoName: loci-integration-app
+          websiteBucketName: timedemo.lab.loci.cat
+          region: ap-southeast-2
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: "10.x"
+            displayName: "Install Node.js"
+          - script: |
+              echo "Installing yarn"
+              sudo npm install -g yarn
+            displayName: Yarn install
+          - script: |
+              echo "Grabbing repo"
+              sudo apt-get install git
+              git clone --single-branch --branch ${{ variables.appBranch }} ${{ variables.appRepo }}
+            displayName: Fetch app repo
+          - script: |
+              cd ${{ variables.repoName }}
+
+              echo "Yarn install"
+              yarn install
+
+              echo "Build website"
+              yarn build
+            displayName: Build website
+          - script: |
+              cd ${{ variables.repoName }}
+              echo "Deploying to s3 bucket ${websiteBucketName}"
+              aws s3 sync ./build/ s3://${{ variables.websiteBucketName }} --acl public-read
+            displayName: Deploy to s3 bucket
+            env:
+              AWS_DEFAULT_REGION: $(region)
+              AWS_ACCESS_KEY_ID: $(awsAccessKeyId)
+              AWS_SECRET_ACCESS_KEY: $(awsSecretAccessKey)
+              AWS_SESSION_TOKEN: $(awsSessionToken)
+
+  # Destroy CDK Application
+  - stage: destroyAPIInfrastructure
+    displayName: Tear Down API Infrastructure
+    dependsOn:
+      - retrieveAWSCreds
+      - retrieveGitTag
+    variables:
+      gitTag: $[ stageDependencies.retrieveGitTag.retrieveTag.outputs['gitDescribeTask.gitTag'] ]
+    jobs:
+      - job: destroyApp
+        condition: startsWith(variables.gitTag,'time-demo/DESTROY')
+        variables:
+          awsAccessKeyId: $[ stageDependencies.retrieveAWSCreds.processVault.outputs['generateAWSCreds.awsAccessKeyId'] ]
+          awsSecretAccessKey: $[ stageDependencies.retrieveAWSCreds.processVault.outputs['generateAWSCreds.awsSecretAccessKey'] ]
+          awsSessionToken: $[ stageDependencies.retrieveAWSCreds.processVault.outputs['generateAWSCreds.awsSessionToken'] ]
+          region: ap-southeast-2
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: "10.x"
+            displayName: "Install Node.js"
+          - script: |
+              echo "Installing aws-cdk"
+              sudo npm install -g aws-cdk 
+
+              echo "Creating virtual environment"
+              sudo apt-get install python3-venv 
+
+              echo "Moving to app folder"
+              cd time_api_infrastructure
+
+              python3 -m venv .venv 
+              source .venv/bin/activate 
+
+              echo "Installing python requirements"
+              pip install -r requirements.txt
+            displayName: Setup environment
+          - script: |
+              echo "Running CDK Deploy"
+              cd time_api_infrastructure
+              source .venv/bin/activate 
+              echo "Destroying infrastructure!"
+              yes | cdk destroy --require-approval never
+            displayName: CDK Destroy
+            env:
+              AWS_ACCESS_KEY_ID: $(awsAccessKeyId)
+              AWS_SECRET_ACCESS_KEY: $(awsSecretAccessKey)
+              AWS_SESSION_TOKEN: $(awsSessionToken)
+              AWS_DEFAULT_REGION: $(region)
+#  - stage: cleanUpCredentialsLease
+#    displayName: Clean Up Credentials Lease
+#    jobs:
+#      - job: revokeVaultLease
+#        condition: always() # this job will always run, even if the pipeline is canceled
+#        displayName: Revoke the AWS credentials Vault lease
+#        variables:
+#          VAULT_TOKEN: $[ stageDependencies.retrieveAWSCreds.processVault.outputs['generateAWSCreds.vaultToken'] ]
+#          VAULT_AWS_LEASE_ID: $[ stageDependencies.retrieveAWSCreds.processVault.outputs['generateAWSCreds.vaultAwsLeaseId'] ]
+#        steps:
+#          - task: Bash@3
+#            name: vaultClientInstaller
+#            displayName: Vault client installer
+#            inputs:
+#              targetType: inline
+#              script: |
+#                curl -fsSL https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_linux_amd64.zip \
+#                  -o ./vault_${VAULT_VERSION}_linux_amd64.zip
+#                REMOTE_SHA=$(curl -fsSL https://releases.hashicorp.com/vault/${VAULT_VERSION}/vault_${VAULT_VERSION}_SHA256SUMS \
+#                  | grep vault_${VAULT_VERSION}_linux_amd64.zip)
+#                LOCAL_SHA=$(sha256sum vault_${VAULT_VERSION}_linux_amd64.zip)
+#                echo "Remote file SHA is: $REMOTE_SHA"
+#                echo "Local file SHA is: $LOCAL_SHA"
+#                if [[ "$REMOTE_SHA" == "$LOCAL_SHA" ]]
+#                then
+#                  unzip -o ./vault_${VAULT_VERSION}_linux_amd64.zip
+#                  chmod +x ./vault
+#                else
+#                  echo "##[error] Checksums do not match!"
+#                  exit 1
+#                fi
+#          - task: Bash@3
+#            name: revokeVaultLeases
+#            displayName: Revoke Vault leases
+#            continueOnError: true # lease has a limited TTL so will eventually expire
+#            inputs:
+#              targetType: inline
+#              script: |
+#                echo 'login to vault'
+#                ./vault login -no-print $(VAULT_TOKEN)
+#                echo 'revoke lease'
+#                ./vault lease revoke $(VAULT_AWS_LEASE_ID)
+#

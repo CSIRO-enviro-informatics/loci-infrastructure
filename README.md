@@ -1,31 +1,126 @@
-# loci-infrastructure
-aws infrastructure for loci
+# LOCI Time-Demo API + DB + Static Website Infrastructure
+Documented below is a deployment system for the LOCI Time-Demo API, the associated Postgis database serving data, as well as a website front end.
 
-Go to environments dir for terraform.
+A lot of the below information is subject to configuration settings in time_api_infrastructure/configuration.py. Please double check these defaults before deploying.
 
-Go to packer dir for packer.
+To deploy, `./ci_deploy.sh`, to destroy, `./ci_destroy.sh` in a bash environment. You will need write access to the repo. No other dependencies are required. Please read below for more info.
 
-Build packer then build using terraform.
+## Deployment components
+- VPC to host EC2 instances
+- Public subnet inside VPC
+- EC2 medium instance for hosting the API which is a containerised Python Sanic API which communicates with the PG database - application starts hosting automatically
+- Postgresql/Postgis DB hosted on EC2 medium instance - restores itself automatically from s3 bucket stored backup
+- S3 bucket to host the website which has the name "timedemo.lab.loci.cat". This is PUBLIC READ bucket so please ensure no sensitive information is available there (it should just be making curls to a public endpoint)
+- Elastic IP allocations for the EC2 instances
+- Route53 mappings for the endpoints (documented below)
 
-Note that in packer/loci-integration-api/loci-integration-api-image.json
-the ami_name should be `loci-integration-api-image[your suffix here] {{timestamp}}` this can control which packer ami image name is created and can later be referenced particularly in test deployments see environments/main2/terraform.auto.tfvars  api_image_tag_suffix 
+## Deployment Endpoints 
+- EC2 API [http://api.lab.loci.cat](http://api.lab.loci.cat:80)
+- EC2 DB (only receives comms from CSIRO VPNs and VPC traffic) [db.lab.loci.cat:5432](db.lab.loci.cat:5432)
+  - You can connect with psql -U postgres -p 5432 -h db.lab.loci.cat 
+  - You will be prompted for the password which changes every deployment - retrieve it from AWS Secrets Manager
+- S3 Time Demo Integration APP [https://timedemo.lab.loci.cat]
 
-## Quickstart
+## Quick deployment
 
-need app.terraform.io token in ~/.terraformrc
+### Deploying using Azure Pipeline (recommended)
+There is a ci_deploy.sh and ci_destroy.sh bash script. You can run these to create a commit with a tag of BUILD* or DESTROY* where * is the build number (tags must be unique). They push the commit, triggering the corresponding build/destroy action in the pipeline. You need to have write access to the infrastructure repo to deploy the system.
 
-cidr ranges to restrict access need to be defined. One way of doing this is to create a file like secrets.tf. secrets_template is provided as a template it can be copied and modified with real ip ranges.
-
-need keys for SSH in a home dir called ~/loci-keys
-
-Valid AWS_ACCESS_KEY, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN need to be defined as environment variables (or via other terraform acceptable means)
-
-Go to `environments/main` for main and `environments\main2` for test and run the following combinations:
-
+### Deploying using your system
+Assuming you have the dependencies installed (see below), to **deploy**:
 ```
-terraform init 
-terraform plan
-terraform apply
-terraform destroy
-as per the terraform documentation
+python3 -m venv .venv 
+source .venv/bin/activate 
+pip install -r requirements.txt 
+cdk deploy 
 ```
+To **destroy**:
+```
+python3 -m venv .venv 
+source .venv/bin/activate 
+pip install -r requirements.txt 
+cdk destroy
+```
+or just 
+```
+cdk destroy
+``` 
+if you already have a virtual environment setup and have sourced it.
+
+
+## Detailed setup steps
+
+Firstly, it is not intended that most users will deploy this system locally. A local deployment will deploy resources to the cloud environment targeted in the app.py file. There is (WIP) a CI/CD pipeline tied to this repo which will keep the build up to date. See "Deploying using Azure Pipeline" above for quick instructions.
+
+### Local deployment (to AWS) requirements:
+- AWS CLI tool installed, see [this](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html)
+- AWS CDK installed, you can install it using the following commands:
+  Install the AWS CDK Toolkit globally using the following Node Package Manager command.
+  ```
+  npm install -g aws-cdk
+  ```
+  Run the following command to verify correct installation and print the version number of the AWS CDK.
+  ```
+  cdk --version
+  ```
+- AWS configured to provide access credentials. You can use SSO to provide temporary keys and export them as environment variables, or you can use SSO with the aws-cli. There are a few extra steps to get CDK to recognise your SSO, first, install aws2-wrap from pip
+  ```
+  pip install aws2-wrap
+  ```
+  Then configure your normal iam-poweruser role using sso like: 
+  ```
+  aws configure sso
+  ```
+  and following the prompts. Once you have your profile configured (make sure to save it as a profile), you can modify your `~/.aws/config` file like so - creating a default and auto profile which use the aws2-wrap to grab credentials from the sso role you have established.
+  ```
+  [profile default]
+  credential_process = aws2-wrap --process --profile poweruser
+  region = ...
+  
+  
+  [profile poweruser]
+  sso_start_url = ...
+  sso_region = ...
+  sso_account_id = ...
+  sso_role_name = IAMPowerUserAccess
+  region = ...
+  output = json
+  
+  [profile auto]
+  credential_process = aws2-wrap --process --profile poweruser
+  region = ...
+  ```
+  Once setup, you can use sso as you would expect, e.g. cdk deploy --profile auto. Make sure you login first with aws sso login --profile poweruser. 
+- You need Python3.8 or greater, also install the virtual environment extension:
+  ```
+  sudo apt-get install python3-venv
+  ```
+
+### Deployment steps
+- Create a virtual environment
+  ```
+  $ python3 -m venv .venv
+  ```
+- Activate the venv
+  ```
+  $ source .venv/bin/activate
+  ```
+- Install requirements into venv
+  ```
+  $ pip install -r requirements.txt
+  ```
+- Use the CDK tool to perform actions, e.g. 
+  - To deploy:
+  ```
+  cdk deploy
+  ```
+  - To destroy the infrastructure (be careful):
+  ```
+  cdk destroy
+  ```
+  - To run a diff over existing (on AWS) vs current:
+  ```
+  cdk diff
+  ``` 
+ 
+	  

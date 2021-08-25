@@ -22,7 +22,7 @@ To deploy, `./ci_deploy.sh`, to destroy, `./ci_destroy.sh` in a bash environment
 - EC2 DB (only receives comms from CSIRO VPNs and VPC traffic) [db.lab.loci.cat:5432](db.lab.loci.cat:5432)
   - You can connect with psql -U postgres -p 5432 -h db.lab.loci.cat
   - You will be prompted for the password which changes every deployment - retrieve it from AWS Secrets Manager
-- S3 Time Demo Integration APP [https://timedemo.lab.loci.cat]
+- S3 Time Demo Integration APP [http://timedemo.lab.loci.cat]
 
 ## Quick deployment
 
